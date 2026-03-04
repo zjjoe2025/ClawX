@@ -12,6 +12,11 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { getOpenClawDir } from './paths';
 import { logger } from './logger';
+import {
+    getBuiltinSkillInstallRetryDelayMs,
+    shouldRetryBuiltinSkillInstallError,
+    shouldTreatBuiltinSkillInstallErrorAsSuccess,
+} from './skill-install';
 
 const OPENCLAW_CONFIG_PATH = join(homedir(), '.openclaw', 'openclaw.json');
 
@@ -156,6 +161,7 @@ const BUILTIN_SKILLS = [
  */
 export async function ensureBuiltinSkillsInstalled(): Promise<void> {
     const skillsRoot = join(homedir(), '.openclaw', 'skills');
+    const maxInstallAttempts = process.platform === 'win32' ? 3 : 1;
 
     for (const { slug, sourceExtension } of BUILTIN_SKILLS) {
         const targetDir = join(skillsRoot, slug);
@@ -173,12 +179,34 @@ export async function ensureBuiltinSkillsInstalled(): Promise<void> {
             continue;
         }
 
-        try {
-            await mkdir(targetDir, { recursive: true });
-            await cp(sourceDir, targetDir, { recursive: true });
-            logger.info(`Installed built-in skill: ${slug} -> ${targetDir}`);
-        } catch (error) {
-            logger.warn(`Failed to install built-in skill ${slug}:`, error);
+        for (let attempt = 1; attempt <= maxInstallAttempts; attempt++) {
+            try {
+                await mkdir(targetDir, { recursive: true });
+                await cp(sourceDir, targetDir, { recursive: true, force: true, errorOnExist: false });
+                logger.info(`Installed built-in skill: ${slug} -> ${targetDir}`);
+                break;
+            } catch (error) {
+                const manifestExistsNow = existsSync(targetManifest);
+
+                if (shouldTreatBuiltinSkillInstallErrorAsSuccess(error, manifestExistsNow)) {
+                    logger.info(`Built-in skill install race resolved for ${slug}; using existing manifest at ${targetManifest}`);
+                    break;
+                }
+
+                const isRetryable = shouldRetryBuiltinSkillInstallError(error) && attempt < maxInstallAttempts;
+                if (isRetryable) {
+                    const delayMs = getBuiltinSkillInstallRetryDelayMs(attempt);
+                    logger.debug(
+                        `Retrying built-in skill install ${slug} after transient error (attempt ${attempt}/${maxInstallAttempts}, delay=${delayMs}ms)`,
+                        error,
+                    );
+                    await new Promise((resolve) => setTimeout(resolve, delayMs));
+                    continue;
+                }
+
+                logger.warn(`Failed to install built-in skill ${slug}:`, error);
+                break;
+            }
         }
     }
 }

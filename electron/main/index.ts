@@ -41,6 +41,7 @@ app.disableHardwareAcceleration();
 let mainWindow: BrowserWindow | null = null;
 const gatewayManager = new GatewayManager();
 const clawHubService = new ClawHubService();
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
 /**
  * Resolve the icons directory path (works in both dev and packaged mode)
@@ -243,29 +244,49 @@ async function initialize(): Promise<void> {
 }
 
 // Application lifecycle
-app.whenReady().then(() => {
-  initialize();
-
-  // Register activate handler AFTER app is ready to prevent
-  // "Cannot create BrowserWindow before app is ready" on macOS.
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      mainWindow = createWindow();
-    } else if (mainWindow && !mainWindow.isDestroyed()) {
-      // On macOS, clicking the dock icon should show the window if it's hidden
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
       mainWindow.show();
       mainWindow.focus();
+      return;
+    }
+
+    if (app.isReady()) {
+      mainWindow = createWindow();
     }
   });
-});
+
+  app.whenReady().then(() => {
+    initialize();
+
+    // Register activate handler AFTER app is ready to prevent
+    // "Cannot create BrowserWindow before app is ready" on macOS.
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        mainWindow = createWindow();
+      } else if (mainWindow && !mainWindow.isDestroyed()) {
+        // On macOS, clicking the dock icon should show the window if it's hidden
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+  });
+}
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  if (process.platform !== 'darwin' && hasSingleInstanceLock) {
     app.quit();
   }
 });
 
 app.on('before-quit', () => {
+  if (!hasSingleInstanceLock) return;
   setQuitting();
   // Fire-and-forget: do not await gatewayManager.stop() here.
   // Awaiting inside before-quit can stall Electron's quit sequence.

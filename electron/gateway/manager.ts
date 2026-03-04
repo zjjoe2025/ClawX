@@ -40,6 +40,7 @@ import {
   isLifecycleSuperseded,
   nextLifecycleEpoch,
 } from './process-policy';
+import { buildGatewayNodeRuntimeArgs } from './runtime-args';
 
 /**
  * Gateway connection status
@@ -840,7 +841,8 @@ export class GatewayManager extends EventEmitter {
 
     const uvEnv = await getUvMirrorEnv();
     const command = app.isPackaged ? getNodeExecutablePath() : 'node';
-    const args = [entryScript, 'doctor', '--fix', '--yes', '--non-interactive'];
+    const runtimeArgs = app.isPackaged ? buildGatewayNodeRuntimeArgs() : [];
+    const args = [...runtimeArgs, entryScript, 'doctor', '--fix', '--yes', '--non-interactive'];
     logger.info(
       `Running OpenClaw doctor repair (command="${command}", args="${args.join(' ')}", cwd="${openclawDir}", bundledBin=${binPathExists ? 'yes' : 'no'})`
     );
@@ -855,11 +857,6 @@ export class GatewayManager extends EventEmitter {
       if (app.isPackaged) {
         spawnEnv['ELECTRON_RUN_AS_NODE'] = '1';
         spawnEnv['OPENCLAW_NO_RESPAWN'] = '1';
-        const existingNodeOpts = spawnEnv['NODE_OPTIONS'] ?? '';
-        if (!existingNodeOpts.includes('--disable-warning=ExperimentalWarning') &&
-          !existingNodeOpts.includes('--no-warnings')) {
-          spawnEnv['NODE_OPTIONS'] = `${existingNodeOpts} --disable-warning=ExperimentalWarning`.trim();
-        }
       }
 
       const child = spawn(command, args, {
@@ -986,12 +983,25 @@ export class GatewayManager extends EventEmitter {
     // In development, use system 'node'.
     const gatewayArgs = ['gateway', '--port', String(this.status.port), '--token', gatewayToken, '--allow-unconfigured'];
 
+    let gatewayPreloadPath: string | undefined;
+    try {
+      const preloadPath = ensureGatewayFetchPreload();
+      if (existsSync(preloadPath)) {
+        gatewayPreloadPath = preloadPath;
+      }
+    } catch (err) {
+      logger.warn('Failed to set up OpenRouter headers preload:', err);
+    }
+
     if (app.isPackaged) {
       // Production: use Electron binary as Node.js via ELECTRON_RUN_AS_NODE
       // On macOS, use the Electron Helper binary to avoid extra dock icons
       if (existsSync(entryScript)) {
+        const runtimeArgs = buildGatewayNodeRuntimeArgs({
+          requireModules: gatewayPreloadPath ? [gatewayPreloadPath] : [],
+        });
         command = getNodeExecutablePath();
-        args = [entryScript, ...gatewayArgs];
+        args = [...runtimeArgs, entryScript, ...gatewayArgs];
         mode = 'packaged';
       } else {
         const errMsg = `OpenClaw entry script not found at: ${entryScript}`;
@@ -1090,26 +1100,15 @@ export class GatewayManager extends EventEmitter {
         // Prevent OpenClaw entry.ts from respawning itself (which would create
         // another child process and a second "exec" dock icon on macOS)
         spawnEnv['OPENCLAW_NO_RESPAWN'] = '1';
-        // Pre-set the NODE_OPTIONS that entry.ts would have added via respawn
-        const existingNodeOpts = spawnEnv['NODE_OPTIONS'] ?? '';
-        if (!existingNodeOpts.includes('--disable-warning=ExperimentalWarning') &&
-          !existingNodeOpts.includes('--no-warnings')) {
-          spawnEnv['NODE_OPTIONS'] = `${existingNodeOpts} --disable-warning=ExperimentalWarning`.trim();
-        }
       }
 
       // Inject fetch preload so OpenRouter requests carry ClawX headers.
       // The preload patches globalThis.fetch before any module loads.
-      try {
-        const preloadPath = ensureGatewayFetchPreload();
-        if (existsSync(preloadPath)) {
-          spawnEnv['NODE_OPTIONS'] = appendNodeRequireToNodeOptions(
-            spawnEnv['NODE_OPTIONS'],
-            preloadPath,
-          );
-        }
-      } catch (err) {
-        logger.warn('Failed to set up OpenRouter headers preload:', err);
+      if (!app.isPackaged && gatewayPreloadPath) {
+        spawnEnv['NODE_OPTIONS'] = appendNodeRequireToNodeOptions(
+          spawnEnv['NODE_OPTIONS'],
+          gatewayPreloadPath,
+        );
       }
 
       const useShell = !app.isPackaged && process.platform === 'win32';

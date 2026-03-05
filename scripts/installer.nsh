@@ -73,7 +73,16 @@
 
   ; Add resources\cli to the current user's PATH for openclaw CLI.
   ; Read current PATH, skip if already present, append otherwise.
+  ;
+  ; IMPORTANT: ReadRegStr silently returns "" when the value exceeds the NSIS
+  ; string buffer (8 192 chars for the electron-builder large-strings build).
+  ; Without an error-flag check we would overwrite the entire user PATH with
+  ; only our CLI directory, destroying every other PATH entry (fnm, cargo,
+  ; python, …).  Always check IfErrors after ReadRegStr.
+  ClearErrors
   ReadRegStr $0 HKCU "Environment" "Path"
+  IfErrors _ci_readFailed
+
   StrCmp $0 "" _ci_setNew
 
   ; Check if our CLI dir is already in PATH
@@ -94,6 +103,12 @@
     WriteRegExpandStr HKCU "Environment" "Path" $0
     ; Broadcast WM_SETTINGCHANGE so running Explorer/terminals pick up the change
     SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=500
+    Goto _ci_done
+
+  _ci_readFailed:
+    ; PATH value could not be read (likely exceeds NSIS buffer).
+    ; Skip modification to avoid destroying existing entries.
+    DetailPrint "Warning: Could not read user PATH (may exceed 8192 chars). Skipping PATH update — add $INSTDIR\resources\cli manually."
 
   _ci_done:
 !macroend
@@ -137,7 +152,9 @@ FunctionEnd
 
 !macro customUnInstall
   ; Remove resources\cli from user PATH
+  ClearErrors
   ReadRegStr $0 HKCU "Environment" "Path"
+  IfErrors _cu_pathDone
   StrCmp $0 "" _cu_pathDone
 
   ; Remove our entry (with leading or trailing semicolons)
@@ -145,8 +162,17 @@ FunctionEnd
   Push "$INSTDIR\resources\cli"
   Call un._cu_RemoveFromPath
   Pop $0
+
+  ; If PATH is now empty, delete the value instead of writing an empty string
+  StrCmp $0 "" _cu_deletePath
   WriteRegExpandStr HKCU "Environment" "Path" $0
-  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=500
+  Goto _cu_pathBroadcast
+
+  _cu_deletePath:
+    DeleteRegValue HKCU "Environment" "Path"
+
+  _cu_pathBroadcast:
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=500
 
   _cu_pathDone:
 

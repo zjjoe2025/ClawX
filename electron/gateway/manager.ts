@@ -11,26 +11,16 @@ import { PORTS } from '../utils/config';
 import {
   getOpenClawDir,
   getOpenClawEntryPath,
-  isOpenClawPresent,
   appendNodeRequireToNodeOptions,
 } from '../utils/paths';
-import { getAllSettings, getSetting } from '../utils/store';
-import { getApiKey, getDefaultProvider, getProvider } from '../utils/secure-storage';
-import { getProviderEnvVar, getKeyableProviderTypes } from '../utils/provider-registry';
+import { getSetting } from '../utils/store';
 import { JsonRpcNotification, isNotification, isResponse } from './protocol';
 import { logger } from '../utils/logger';
-import { getUvMirrorEnv } from '../utils/uv-env';
 import { isPythonReady, setupManagedPython } from '../utils/uv-setup';
 import {
   loadOrCreateDeviceIdentity,
-  signDevicePayload,
-  publicKeyRawBase64UrlFromPem,
-  buildDeviceAuthPayload,
   type DeviceIdentity,
 } from '../utils/device-identity';
-import { syncGatewayTokenToConfig, syncBrowserConfigToOpenClaw, sanitizeOpenClawConfig } from '../utils/openclaw-auth';
-import { buildProxyEnv, resolveProxySettings } from '../utils/proxy';
-import { syncProxyConfigToOpenClaw } from '../utils/openclaw-proxy';
 import { shouldAttemptConfigAutoRepair } from './startup-recovery';
 import {
   type GatewayLifecycleState,
@@ -47,6 +37,9 @@ import {
   type PendingGatewayRequest,
 } from './request-store';
 import { dispatchJsonRpcNotification, dispatchProtocolEvent } from './event-dispatch';
+import { GatewayStateController } from './state';
+import { prepareGatewayLaunchContext } from './config-sync';
+import { buildGatewayConnectFrame, probeGatewayReady } from './ws-client';
 
 /**
  * Gateway connection status
@@ -211,6 +204,7 @@ export class GatewayManager extends EventEmitter {
   private ownsProcess = false;
   private ws: WebSocket | null = null;
   private status: GatewayStatus = { state: 'stopped', port: PORTS.OPENCLAW_GATEWAY };
+  private readonly stateController: GatewayStateController;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingInterval: NodeJS.Timeout | null = null;
   private healthCheckInterval: NodeJS.Timeout | null = null;
@@ -229,6 +223,15 @@ export class GatewayManager extends EventEmitter {
 
   constructor(config?: Partial<ReconnectConfig>) {
     super();
+    this.stateController = new GatewayStateController({
+      emitStatus: (status) => {
+        this.status = status;
+        this.emit('status', status);
+      },
+      onTransition: (previousState, nextState) => {
+        this.flushDeferredRestart(`status:${previousState}->${nextState}`);
+      },
+    });
     this.reconnectConfig = { ...DEFAULT_RECONNECT_CONFIG, ...config };
     // Device identity is loaded lazily in start() — not in the constructor —
     // so that async file I/O and key generation don't block module loading.
@@ -356,14 +359,14 @@ export class GatewayManager extends EventEmitter {
    * Get current Gateway status
    */
   getStatus(): GatewayStatus {
-    return { ...this.status };
+    return this.stateController.getStatus();
   }
 
   /**
    * Check if Gateway is connected and ready
    */
   isConnected(): boolean {
-    return this.status.state === 'running' && this.ws?.readyState === WebSocket.OPEN;
+    return this.stateController.isConnected(this.ws?.readyState === WebSocket.OPEN);
   }
 
   /**
@@ -1060,137 +1063,27 @@ export class GatewayManager extends EventEmitter {
   private async startProcess(): Promise<void> {
     // Ensure no system-managed gateway service will compete with our process.
     await this.unloadLaunchctlService();
+    const launchContext = await prepareGatewayLaunchContext(this.status.port);
+    const {
+      openclawDir,
+      entryScript,
+      gatewayArgs,
+      forkEnv,
+      mode,
+      binPathExists,
+      loadedProviderKeyCount,
+      proxySummary,
+    } = launchContext;
 
-    const openclawDir = getOpenClawDir();
-    const entryScript = getOpenClawEntryPath();
-
-    // Verify OpenClaw package exists
-    if (!isOpenClawPresent()) {
-      const errMsg = `OpenClaw package not found at: ${openclawDir}`;
-      logger.error(errMsg);
-      throw new Error(errMsg);
-    }
-
-    // Get or generate gateway token
-    const appSettings = await getAllSettings();
-    const gatewayToken = appSettings.gatewayToken;
-    await syncProxyConfigToOpenClaw(appSettings);
-
-    // Strip stale/invalid keys from openclaw.json that would cause the
-    // Gateway's strict config validation to reject the file on startup
-    // (e.g. `skills.enabled` left by an older version).
-    // This is a fast file-based pre-check; the reactive auto-repair
-    // mechanism (runOpenClawDoctorRepair) handles any remaining issues.
-    try {
-      await sanitizeOpenClawConfig();
-    } catch (err) {
-      logger.warn('Failed to sanitize openclaw.json:', err);
-    }
-
-    // Write our token into openclaw.json before starting the process.
-    // Without --dev the gateway authenticates using the token in
-    // openclaw.json; if that file has a stale token (e.g. left by the
-    // system-managed launchctl service) the WebSocket handshake will fail
-    // with "token mismatch" even though we pass --token on the CLI.
-    try {
-      await syncGatewayTokenToConfig(gatewayToken);
-    } catch (err) {
-      logger.warn('Failed to sync gateway token to openclaw.json:', err);
-    }
-
-    try {
-      await syncBrowserConfigToOpenClaw();
-    } catch (err) {
-      logger.warn('Failed to sync browser config to openclaw.json:', err);
-    }
-
-    // utilityProcess.fork() works for both dev and packaged — no ELECTRON_RUN_AS_NODE needed.
-    if (!existsSync(entryScript)) {
-      const errMsg = `OpenClaw entry script not found at: ${entryScript}`;
-      logger.error(errMsg);
-      throw new Error(errMsg);
-    }
-
-    const gatewayArgs = ['gateway', '--port', String(this.status.port), '--token', gatewayToken, '--allow-unconfigured'];
-    const mode = app.isPackaged ? 'packaged' : 'dev';
-
-    // Resolve bundled bin path for uv
-    const platform = process.platform;
-    const arch = process.arch;
-    const target = `${platform}-${arch}`;
-
-    const binPath = app.isPackaged
-      ? path.join(process.resourcesPath, 'bin')
-      : path.join(process.cwd(), 'resources', 'bin', target);
-
-    const binPathExists = existsSync(binPath);
-    const finalPath = binPathExists
-      ? `${binPath}${path.delimiter}${process.env.PATH || ''}`
-      : process.env.PATH || '';
-
-    // Load provider API keys from storage to pass as environment variables
-    const providerEnv: Record<string, string> = {};
-    const providerTypes = getKeyableProviderTypes();
-    let loadedProviderKeyCount = 0;
-
-    // Prefer the selected default provider key when provider IDs are instance-based.
-    try {
-      const defaultProviderId = await getDefaultProvider();
-      if (defaultProviderId) {
-        const defaultProvider = await getProvider(defaultProviderId);
-        const defaultProviderType = defaultProvider?.type;
-        const defaultProviderKey = await getApiKey(defaultProviderId);
-        if (defaultProviderType && defaultProviderKey) {
-          const envVar = getProviderEnvVar(defaultProviderType);
-          if (envVar) {
-            providerEnv[envVar] = defaultProviderKey;
-            loadedProviderKeyCount++;
-          }
-        }
-      }
-    } catch (err) {
-      logger.warn('Failed to load default provider key for environment injection:', err);
-    }
-
-    for (const providerType of providerTypes) {
-      try {
-        const key = await getApiKey(providerType);
-        if (key) {
-          const envVar = getProviderEnvVar(providerType);
-          if (envVar) {
-            providerEnv[envVar] = key;
-            loadedProviderKeyCount++;
-          }
-        }
-      } catch (err) {
-        logger.warn(`Failed to load API key for ${providerType}:`, err);
-      }
-    }
-
-    const uvEnv = await getUvMirrorEnv();
-    const proxyEnv = buildProxyEnv(appSettings);
-    const resolvedProxy = resolveProxySettings(appSettings);
     logger.info(
-      `Starting Gateway process (mode=${mode}, port=${this.status.port}, entry="${entryScript}", args="${this.sanitizeSpawnArgs(gatewayArgs).join(' ')}", cwd="${openclawDir}", bundledBin=${binPathExists ? 'yes' : 'no'}, providerKeys=${loadedProviderKeyCount}, proxy=${appSettings.proxyEnabled ? `http=${resolvedProxy.httpProxy || '-'}, https=${resolvedProxy.httpsProxy || '-'}, all=${resolvedProxy.allProxy || '-'}` : 'disabled'})`
+      `Starting Gateway process (mode=${mode}, port=${this.status.port}, entry="${entryScript}", args="${this.sanitizeSpawnArgs(gatewayArgs).join(' ')}", cwd="${openclawDir}", bundledBin=${binPathExists ? 'yes' : 'no'}, providerKeys=${loadedProviderKeyCount}, proxy=${proxySummary})`
     );
     this.lastSpawnSummary = `mode=${mode}, entry="${entryScript}", args="${this.sanitizeSpawnArgs(gatewayArgs).join(' ')}", cwd="${openclawDir}"`;
 
     return new Promise((resolve, reject) => {
       // Reset exit tracking for this new process instance.
       this.processExitCode = null;
-      const { NODE_OPTIONS: _nodeOptions, ...baseEnv } = process.env;
-      const forkEnv: Record<string, string | undefined> = {
-        ...baseEnv,
-        PATH: finalPath,
-        ...providerEnv,
-        ...uvEnv,
-        ...proxyEnv,
-        OPENCLAW_GATEWAY_TOKEN: gatewayToken,
-        OPENCLAW_SKIP_CHANNELS: '',
-        CLAWDBOT_SKIP_CHANNELS: '',
-        // Prevent OpenClaw from respawning itself inside the utility process
-        OPENCLAW_NO_RESPAWN: '1',
-      };
+      const runtimeEnv = { ...forkEnv };
 
       // Inject fetch preload so OpenRouter requests carry ClawX headers.
       // The preload patches globalThis.fetch before any module loads.
@@ -1201,8 +1094,8 @@ export class GatewayManager extends EventEmitter {
         try {
           const preloadPath = ensureGatewayFetchPreload();
           if (existsSync(preloadPath)) {
-            forkEnv['NODE_OPTIONS'] = appendNodeRequireToNodeOptions(
-              forkEnv['NODE_OPTIONS'],
+            runtimeEnv['NODE_OPTIONS'] = appendNodeRequireToNodeOptions(
+              runtimeEnv['NODE_OPTIONS'],
               preloadPath,
             );
           }
@@ -1216,7 +1109,7 @@ export class GatewayManager extends EventEmitter {
       this.process = utilityProcess.fork(entryScript, gatewayArgs, {
         cwd: openclawDir,
         stdio: 'pipe',
-        env: forkEnv as NodeJS.ProcessEnv,
+        env: runtimeEnv as NodeJS.ProcessEnv,
         serviceName: 'OpenClaw Gateway',
       });
       const child = this.process;
@@ -1289,24 +1182,7 @@ export class GatewayManager extends EventEmitter {
       }
 
       try {
-        const ready = await new Promise<boolean>((resolve) => {
-          const testWs = new WebSocket(`ws://localhost:${this.status.port}/ws`);
-          const timeout = setTimeout(() => {
-            testWs.close();
-            resolve(false);
-          }, 2000);
-
-          testWs.on('open', () => {
-            clearTimeout(timeout);
-            testWs.close();
-            resolve(true);
-          });
-
-          testWs.on('error', () => {
-            clearTimeout(timeout);
-            resolve(false);
-          });
-        });
+        const ready = await probeGatewayReady(this.status.port, 2000);
 
         if (ready) {
           logger.debug(`Gateway ready after ${i + 1} attempt(s)`);
@@ -1383,62 +1259,15 @@ export class GatewayManager extends EventEmitter {
         logger.debug('Sending connect handshake with challenge nonce');
 
         const currentToken = await getSetting('gatewayToken');
+        const connectPayload = buildGatewayConnectFrame({
+          challengeNonce,
+          token: currentToken,
+          deviceIdentity: this.deviceIdentity,
+          platform: process.platform,
+        });
+        connectId = connectPayload.connectId;
 
-        connectId = `connect-${Date.now()}`;
-        const role = 'operator';
-        const scopes = ['operator.admin'];
-        const signedAtMs = Date.now();
-        const clientId = 'gateway-client';
-        const clientMode = 'ui';
-
-        const device = (() => {
-          if (!this.deviceIdentity) return undefined;
-
-          const payload = buildDeviceAuthPayload({
-            deviceId: this.deviceIdentity.deviceId,
-            clientId,
-            clientMode,
-            role,
-            scopes,
-            signedAtMs,
-            token: currentToken ?? null,
-            nonce: challengeNonce,
-          });
-          const signature = signDevicePayload(this.deviceIdentity.privateKeyPem, payload);
-          return {
-            id: this.deviceIdentity.deviceId,
-            publicKey: publicKeyRawBase64UrlFromPem(this.deviceIdentity.publicKeyPem),
-            signature,
-            signedAt: signedAtMs,
-            nonce: challengeNonce,
-          };
-        })();
-
-        const connectFrame = {
-          type: 'req',
-          id: connectId,
-          method: 'connect',
-          params: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            client: {
-              id: clientId,
-              displayName: 'ClawX',
-              version: '0.1.0',
-              platform: process.platform,
-              mode: clientMode,
-            },
-            auth: {
-              token: currentToken,
-            },
-            caps: [],
-            role,
-            scopes,
-            device,
-          },
-        };
-
-        this.ws?.send(JSON.stringify(connectFrame));
+        this.ws?.send(JSON.stringify(connectPayload.frame));
 
         const requestTimeout = setTimeout(() => {
           if (!handshakeComplete) {
@@ -1679,20 +1508,6 @@ export class GatewayManager extends EventEmitter {
    * Update status and emit event
    */
   private setStatus(update: Partial<GatewayStatus>): void {
-    const previousState = this.status.state;
-    this.status = { ...this.status, ...update };
-
-    // Calculate uptime if connected
-    if (this.status.state === 'running' && this.status.connectedAt) {
-      this.status.uptime = Date.now() - this.status.connectedAt;
-    }
-
-    this.emit('status', this.status);
-
-    // Log state transitions
-    if (previousState !== this.status.state) {
-      logger.debug(`Gateway state changed: ${previousState} -> ${this.status.state}`);
-      this.flushDeferredRestart(`status:${previousState}->${this.status.state}`);
-    }
+    this.stateController.setStatus(update);
   }
 }
